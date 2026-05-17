@@ -11,6 +11,7 @@ use Psr\Http\Client\ClientInterface;
 use Psr\Http\Message\RequestFactoryInterface;
 use Psr\Http\Message\StreamFactoryInterface;
 use Psr\Log\LoggerInterface;
+use Psr\SimpleCache\CacheInterface;
 
 class TranscriptListFetcher
 {
@@ -22,36 +23,57 @@ class TranscriptListFetcher
             'clientVersion' => '20.10.38',
         ],
     ];
+    private const INNERTUBE_API_KEY_CACHE_KEY = 'youtube_transcript_innertube_api_key';
 
     public function __construct(
         private ClientInterface $http_client,
         private RequestFactoryInterface $request_factory,
         private StreamFactoryInterface $stream_factory,
         private ?LoggerInterface $logger = null,
+        private ?CacheInterface $cache = null,
     ) {
 
     }
 
     public function fetch(string $video_id): TranscriptList
     {
-        $video_page_html = $this->fetchVideoHtml($video_id);
-        $api_key = $this->extractInnertubeApiKey($video_page_html, $video_id);
-        $innertube_data = $this->fetchInnertubeData($video_id, $api_key);
+        $api_key = $this->resolveInnertubeApiKey($video_id);
+        try {
+            $innertube_data = $this->fetchInnertubeData($video_id, $api_key);
+        } catch (YouTubeRequestFailedException $e) {
+            $this->cache?->delete(self::INNERTUBE_API_KEY_CACHE_KEY);
+            throw $e;
+        }
         try {
             return TranscriptList::build(
                 $this->http_client,
                 $this->request_factory,
                 $video_id,
-                $this->extractCaptionsJson($innertube_data, $video_id),
-                $this->extractVideoTitle($video_page_html)
+                $this->extractCaptionsJson($innertube_data, $video_id)
             );
         } catch (\Throwable $th) {
-            $this->logger?->debug('Loaded video page content. video id: {video_id}, content: {content}', [
+            $this->logger?->debug('Failed to build transcript list. video_id: {video_id}', [
                 'video_id' => $video_id,
-                'content' => $video_page_html,
             ]);
             throw $th;
         }
+    }
+
+    private function resolveInnertubeApiKey(string $video_id): string
+    {
+        if ($this->cache !== null) {
+            $cached = $this->cache->get(self::INNERTUBE_API_KEY_CACHE_KEY);
+            if (\is_string($cached)) {
+                return $cached;
+            }
+        }
+
+        $html = $this->fetchVideoHtml($video_id);
+        $api_key = $this->extractInnertubeApiKey($html, $video_id);
+
+        $this->cache?->set(self::INNERTUBE_API_KEY_CACHE_KEY, $api_key, 86400);
+
+        return $api_key;
     }
 
     private function extractInnertubeApiKey(string $html, string $video_id): string
@@ -142,14 +164,5 @@ class TranscriptListFetcher
             throw new YouTubeRequestFailedException($response->getReasonPhrase());
         }
         return htmlspecialchars_decode($response->getBody()->getContents());
-    }
-
-    public function extractVideoTitle(string $html): string
-    {
-        preg_match('/<meta name="title" content="(.*?)"/', $html, $match);
-        if (!$match) {
-            return '';
-        }
-        return $match[1];
     }
 }
